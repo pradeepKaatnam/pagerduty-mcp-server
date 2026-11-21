@@ -1,0 +1,25 @@
+{
+  "servers": {
+    "pagerduty": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${workspaceFolder}",
+        "run",
+        "server.py"
+      ],
+      "env": {
+        "PAGERDUTY_API_TOKEN": "${input:pagerduty_api_token}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "pagerduty_api_token",
+      "type": "promptString",
+      "description": "PagerDuty REST API v2 Token",
+      "password": true
+    }
+  ]
+}
