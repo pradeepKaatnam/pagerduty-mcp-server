@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
-from urllib.parse import quote
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 from client import PagerDutyAPIError, PagerDutyClient
 
@@ -16,7 +16,9 @@ mcp = MCPServer(
     instructions=(
         "PagerDuty MCP server for on-call coverage and active incident triage. "
         "When given a service name, call `list_services(query=...)` first to find its `service_id`; "
-        "if multiple services match, ask the user which service they mean before calling other tools."
+        "if multiple services match, ask the user which service they mean before calling other tools. "
+        "When a tool returns `has_more: true` and the user did not ask to fetch all pages, "
+        "mention that more results are available and they can ask for the next page."
     ),
 )
 
@@ -72,14 +74,21 @@ def _extract_names(entries: list[dict[str, Any]], nested_key: str) -> list[str]:
 
 @mcp.tool()
 async def list_services(
-    query: str | None = None,
-    limit: int = 25,
-    offset: int = 0,
+    query: Annotated[
+        str | None,
+        Field(description="Optional case-insensitive substring to filter services by name."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=100, description="Maximum number of services to return (1-100)."),
+    ] = 25,
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Pagination offset (>= 0)."),
+    ] = 0,
 ) -> dict[str, Any]:
-    """List PagerDuty services, optionally filtered by name `query`.
-
-    Call this first when given a service name to find its `service_id`. If multiple
-    services match, ask the user to confirm the exact service.
+    """List PagerDuty services. Call this first when given a service name to find its
+    `service_id`; if multiple services match, ask the user to confirm the exact service.
     """
     params = {"query": query.strip()} if query and query.strip() else None
     try:
@@ -96,7 +105,7 @@ async def list_services(
     services = [
         {
             "id": s["id"],
-            "name": s.get("name") or s.get("summary") or "",
+            "name": _ref_name(s) or "",
             "status": s.get("status"),
             "description": s.get("description") or None,
         }
@@ -106,30 +115,38 @@ async def list_services(
 
 
 @mcp.tool()
-async def get_on_call_users(service_id: str) -> dict[str, Any]:
-    """Return the people currently on call for a PagerDuty service, with their first name,
+async def get_on_call_users(
+    service_id: Annotated[
+        str,
+        Field(description="PagerDuty service ID. Call `list_services` first if you only have a service name."),
+    ],
+    limit: Annotated[
+        int,
+        Field(ge=1, le=100, description="Maximum number of on-call entries to inspect per page (1-100)."),
+    ] = 25,
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Pagination offset (>= 0)."),
+    ] = 0,
+) -> dict[str, Any]:
+    """Return the people currently on call for a PagerDuty service, including their first name,
     last name, escalation levels, schedules, and email/phone/SMS contact methods.
-
-    Args:
-        service_id: PagerDuty service ID. Call `list_services` first if you only have a service name.
     """
-    cleaned_id = service_id.strip()
-    if not cleaned_id:
+    service_id = service_id.strip()
+    if not service_id:
         raise ToolError("service_id cannot be empty.")
 
     try:
-        service = (await pd.get(f"/services/{quote(cleaned_id, safe='')}"))["service"]
-        ep = service.get("escalation_policy") or {}
-        ep_id = ep.get("id")
-        if not ep_id:
-            return {
-                "service_id": service["id"],
-                "service_name": service.get("name") or service.get("summary") or "",
-                "escalation_policy_name": None,
-                "responders": [],
-            }
+        service = (await pd.get(f"/services/{service_id}"))["service"]
+        ep = service["escalation_policy"]
 
-        oncalls = await pd.get_all("/oncalls", "oncalls", params={"escalation_policy_ids[]": [ep_id]})
+        oncalls, has_more = await pd.get_page(
+            "/oncalls",
+            "oncalls",
+            params={"escalation_policy_ids[]": [ep["id"]]},
+            limit=limit,
+            offset=offset,
+        )
 
         grouped: dict[str, dict[str, Any]] = {}
         for entry in oncalls:
@@ -137,29 +154,26 @@ async def get_on_call_users(service_id: str) -> dict[str, Any]:
             uid = user.get("id")
             if not uid:
                 continue
-            bucket = grouped.setdefault(uid, {"user": user, "levels": set(), "schedules": []})
+            if uid not in grouped:
+                grouped[uid] = {"user": user, "levels": set(), "schedules": []}
             if isinstance(entry.get("escalation_level"), int):
-                bucket["levels"].add(entry["escalation_level"])
+                grouped[uid]["levels"].add(entry["escalation_level"])
             sched_name = _ref_name(entry.get("schedule"))
-            if sched_name and sched_name not in bucket["schedules"]:
-                bucket["schedules"].append(sched_name)
+            if sched_name and sched_name not in grouped[uid]["schedules"]:
+                grouped[uid]["schedules"].append(sched_name)
 
         user_ids = list(grouped.keys())
-        contact_responses = await asyncio.gather(
-            *(pd.get(f"/users/{quote(uid, safe='')}/contact_methods") for uid in user_ids)
-        )
+        tasks = [pd.get(f"/users/{uid}/contact_methods") for uid in user_ids]
+        contact_responses = await asyncio.gather(*tasks)
     except PagerDutyAPIError as exc:
         raise ToolError(str(exc)) from exc
 
-    contacts_by_user = {
-        uid: (resp.get("contact_methods") or [])
-        for uid, resp in zip(user_ids, contact_responses, strict=False)
-    }
-
     responders: list[dict[str, Any]] = []
-    for uid, data in grouped.items():
-        full_name = data["user"].get("name") or data["user"].get("summary") or ""
-        first_name, last_name = _split_name(full_name)
+    for i in range(len(user_ids)):
+        uid = user_ids[i]
+        data = grouped[uid]
+        raw_methods = contact_responses[i].get("contact_methods") or []
+        first_name, last_name = _split_name(_ref_name(data["user"]) or "")
         responders.append(
             {
                 "user_id": uid,
@@ -167,29 +181,40 @@ async def get_on_call_users(service_id: str) -> dict[str, Any]:
                 "last_name": last_name,
                 "escalation_levels": sorted(data["levels"]),
                 "schedules": data["schedules"],
-                "contact_methods": _format_contacts(contacts_by_user.get(uid, [])),
+                "contact_methods": _format_contacts(raw_methods),
             }
         )
 
     responders.sort(key=lambda r: (r["escalation_levels"][0] if r["escalation_levels"] else 999, r["first_name"]))
     return {
         "service_id": service["id"],
-        "service_name": service.get("name") or service.get("summary") or "",
-        "escalation_policy_name": ep.get("name") or ep.get("summary"),
+        "service_name": _ref_name(service) or "",
+        "escalation_policy_name": _ref_name(ep),
         "responders": responders,
+        "has_more": has_more,
     }
 
 
 @mcp.tool()
 async def list_open_incidents(
-    service_id: str | None = None,
-    urgency: Literal["high", "low"] | None = None,
-    limit: int = 25,
-    offset: int = 0,
+    service_id: Annotated[
+        str | None,
+        Field(description="Optional PagerDuty service ID to filter incidents."),
+    ] = None,
+    urgency: Annotated[
+        Literal["high", "low"] | None,
+        Field(description="Optional urgency filter ('high' or 'low')."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=100, description="Maximum number of incidents to return (1-100)."),
+    ] = 25,
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Pagination offset (>= 0)."),
+    ] = 0,
 ) -> dict[str, Any]:
-    """List open PagerDuty incidents (`triggered` and `acknowledged`), optionally filtered
-    by `service_id` or `urgency`.
-    """
+    """List open PagerDuty incidents (`triggered` and `acknowledged`)."""
     params: dict[str, Any] = {
         "statuses[]": ["triggered", "acknowledged"],
         "date_range": "all",
@@ -231,27 +256,33 @@ async def list_open_incidents(
 
 
 @mcp.tool()
-async def get_incident_context(incident_id: str) -> dict[str, Any]:
+async def get_incident_context(
+    incident_id: Annotated[
+        str,
+        Field(description="PagerDuty incident ID or incident number."),
+    ],
+) -> dict[str, Any]:
     """Return the context needed to investigate a PagerDuty incident: status, urgency,
-    priority, acknowledgements, assignees, service, escalation policy, teams, initial
-    trigger details, alerts, and notes.
+    priority, acknowledgements, assignees, timestamps, service, escalation policy, teams,
+    initial trigger details, alerts, and notes.
     """
-    cleaned_id = incident_id.strip()
-    if not cleaned_id:
+    incident_id = incident_id.strip()
+    if not incident_id:
         raise ToolError("incident_id cannot be empty.")
 
     try:
         inc_resp = await pd.get(
-            f"/incidents/{quote(cleaned_id, safe='')}",
+            f"/incidents/{incident_id}",
             params={"include[]": ["first_trigger_log_entries"]},
         )
         incident = inc_resp["incident"]
-        canonical_id = quote(incident["id"], safe="")
+        canonical_id = incident["id"]
 
-        (raw_alerts, alerts_has_more), notes_resp = await asyncio.gather(
+        alerts_page, notes_resp = await asyncio.gather(
             pd.get_page(f"/incidents/{canonical_id}/alerts", "alerts", limit=25, offset=0),
             pd.get(f"/incidents/{canonical_id}/notes"),
         )
+        raw_alerts, alerts_has_more = alerts_page
     except PagerDutyAPIError as exc:
         raise ToolError(str(exc)) from exc
 
@@ -280,6 +311,12 @@ async def get_incident_context(incident_id: str) -> dict[str, Any]:
         for n in (notes_resp.get("notes") or [])
     ]
 
+    teams: list[str] = []
+    for team in incident.get("teams") or []:
+        team_name = _ref_name(team)
+        if team_name:
+            teams.append(team_name)
+
     return {
         "id": incident["id"],
         "incident_number": incident.get("incident_number"),
@@ -291,11 +328,13 @@ async def get_incident_context(incident_id: str) -> dict[str, Any]:
         "acknowledged_by": _extract_names(incident.get("acknowledgements") or [], "acknowledger"),
         "assignees": _extract_names(incident.get("assignments") or [], "assignee"),
         "created_at": incident["created_at"],
+        "last_status_change_at": incident.get("last_status_change_at"),
+        "resolved_at": incident.get("resolved_at"),
         "html_url": incident.get("html_url"),
         "service_id": service.get("id"),
         "service_name": _ref_name(service),
         "escalation_policy_name": _ref_name(incident.get("escalation_policy")),
-        "teams": [name for t in (incident.get("teams") or []) if (name := _ref_name(t))],
+        "teams": teams,
         "trigger_details": channel.get("details"),
         "alerts": alerts,
         "alerts_has_more": alerts_has_more,

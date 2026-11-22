@@ -110,29 +110,8 @@ class PagerDutyClient:
         limit: int = 25,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], bool]:
-        query = {
-            **(params or {}),
-            "limit": max(1, min(limit, MAX_PAGE_SIZE)),
-            "offset": max(0, offset),
-        }
+        query = dict(params) if params else {}
+        query["limit"] = max(1, min(limit, MAX_PAGE_SIZE))
+        query["offset"] = max(0, offset)
         data = await self.get(path, params=query)
         return data.get(key) or [], bool(data.get("more", False))
-
-    async def get_all(
-        self,
-        path: str,
-        key: str,
-        params: dict[str, Any] | None = None,
-        page_size: int = MAX_PAGE_SIZE,
-        max_items: int = 500,
-    ) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        offset = 0
-        while len(items) < max_items:
-            batch_size = min(page_size, max_items - len(items))
-            page, has_more = await self.get_page(path, key, params=params, limit=batch_size, offset=offset)
-            items.extend(page)
-            if not has_more or not page:
-                break
-            offset += len(page)
-        return items

@@ -9,9 +9,9 @@ A Python [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server
 | Tool | Purpose | Inputs | Output |
 |---|---|---|---|
 | `list_services` | List PagerDuty services to discover `service_id` | `query?`, `limit=25`, `offset=0` | `services` (`id`, `name`, `status`, `description`), `count`, `has_more` |
-| `get_on_call_users` | Return who is currently on call for a service and how to contact them | `service_id` | Deduplicated `responders` (`first_name`, `last_name`, `escalation_levels`, `schedules`, `email` / `phone` / `sms` `contact_methods`) |
+| `get_on_call_users` | Return who is currently on call for a service and how to contact them | `service_id`, `limit=25`, `offset=0` | Deduplicated `responders` (`first_name`, `last_name`, `escalation_levels`, `schedules`, `email` / `phone` / `sms` `contact_methods`), `has_more` |
 | `list_open_incidents` | List open (`triggered` and `acknowledged`) incidents | `service_id?`, `urgency?`, `limit=25`, `offset=0` | `incidents` (`id`, `incident_number`, `title`, `status`, `urgency`, `priority`, `acknowledged_by`, `assignees`, `service_id`, `service_name`, `created_at`), `count`, `has_more` |
-| `get_incident_context` | Return investigation context for an incident | `incident_id` | Incident details, `acknowledged_by`, `assignees`, service, escalation policy, `teams`, initial `trigger_details`, `alerts`, and `notes` |
+| `get_incident_context` | Return investigation context for an incident | `incident_id` | Incident details, `acknowledged_by`, `assignees`, timestamps, service, escalation policy, `teams`, initial `trigger_details`, `alerts` (`alerts_has_more`), and `notes` |
 
 ---
 
@@ -33,7 +33,7 @@ Or with `pip`:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install "mcp>=2,<3" "httpx>=0.27" pytest pytest-asyncio respx
+pip install "mcp>=2,<3" "httpx>=0.27" "pydantic>=2" pytest pytest-asyncio respx
 ```
 
 ---
@@ -105,4 +105,4 @@ uv run pytest -v
   3. `/oncalls` only returns user references, so `/users/{id}/contact_methods` is fetched concurrently (`asyncio.gather`) for each unique responder to return email, phone, and SMS channels.
 - **Open incidents window (`date_range="all"`):** PagerDuty's `GET /incidents` defaults to the last 30 days; passing `statuses[]=["triggered", "acknowledged"]` with `date_range="all"` ensures older unresolved incidents aren't missed.
 - **Incident context (`get_incident_context`):** `GET /incidents/{id}` accepts either an incident number or an alphanumeric ID, whereas `GET /incidents/{id}/alerts` requires the alphanumeric ID. Fetching the incident first (`include[]=first_trigger_log_entries`) provides both initial trigger details and the canonical `incident["id"]`, then `/alerts` and `/notes` are fetched in parallel.
-- **Pagination & rate limits:** `list_services` and `list_open_incidents` expose `limit` (`1..100`) and `offset` with `has_more`, while `/oncalls` auto-paginates (`get_all`, capped at 500) so multi-schedule policies aren't truncated. `PagerDutyClient` retries `429` (honoring `Retry-After`) and transient `5xx` / network errors with exponential backoff.
+- **Pagination & rate limits:** List endpoints use bounded single-page calls (`limit` clamped to `1..100`, `offset >= 0`) and return `has_more` from PagerDuty's `more` flag so the LLM can either fetch the next page or let the user know more results exist without flooding the context window. `PagerDutyClient` retries `429` (honoring `Retry-After`) and transient `5xx` / network errors with exponential backoff.

@@ -36,17 +36,16 @@ async def test_retries_on_429_with_retry_after() -> None:
 
 
 @respx.mock
-async def test_get_all_paginates_across_pages() -> None:
-    def page_handler(request: httpx.Request) -> httpx.Response:
-        offset = int(request.url.params.get("offset", "0"))
-        if offset == 0:
-            return httpx.Response(200, json={"oncalls": [{"id": "1"}, {"id": "2"}], "more": True})
-        return httpx.Response(200, json={"oncalls": [{"id": "3"}], "more": False})
-
-    respx.get(f"{BASE}/oncalls").mock(side_effect=page_handler)
+async def test_get_page_clamps_limit_and_returns_has_more() -> None:
+    route = respx.get(f"{BASE}/oncalls").mock(
+        return_value=httpx.Response(200, json={"oncalls": [{"id": "1"}, {"id": "2"}], "more": True})
+    )
     client = PagerDutyClient(api_token="test-token")
-    all_items = await client.get_all("/oncalls", "oncalls", page_size=2, max_items=10)
-    assert [x["id"] for x in all_items] == ["1", "2", "3"]
+    items, has_more = await client.get_page("/oncalls", "oncalls", limit=500, offset=10)
+    assert route.calls.last.request.url.params["limit"] == "100"
+    assert route.calls.last.request.url.params["offset"] == "10"
+    assert [x["id"] for x in items] == ["1", "2"]
+    assert has_more is True
 
 
 @respx.mock
@@ -142,6 +141,8 @@ async def test_mcp_tools_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
                     "urgency": "high",
                     "priority": {"summary": "P1"},
                     "created_at": "2026-11-20T12:00:00Z",
+                    "last_status_change_at": "2026-11-20T12:05:00Z",
+                    "resolved_at": None,
                     "service": {"id": "PSVC_PAY", "summary": "Payments"},
                     "escalation_policy": {"id": "PEP_PAY", "summary": "Payments Escalation"},
                     "assignments": [{"assignee": {"summary": "Kyle Martinez"}}],
@@ -177,12 +178,15 @@ async def test_mcp_tools_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
 
     async with Client(mcp) as mcp_client:
         tools = await mcp_client.list_tools()
-        assert {t.name for t in tools.tools} == {
+        tools_by_name = {t.name: t for t in tools.tools}
+        assert set(tools_by_name) == {
             "list_services",
             "get_on_call_users",
             "list_open_incidents",
             "get_incident_context",
         }
+        assert "incident number" in tools_by_name["get_incident_context"].input_schema["properties"]["incident_id"]["description"]
+        assert tools_by_name["list_services"].input_schema["properties"]["limit"]["maximum"] == 100
 
         svcs = await mcp_client.call_tool("list_services", {"query": "Payments"})
         assert svcs.structured_content["services"][0]["id"] == "PSVC_PAY"
@@ -190,6 +194,7 @@ async def test_mcp_tools_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
         oncall = await mcp_client.call_tool("get_on_call_users", {"service_id": "PSVC_PAY"})
         assert oncalls_route.calls.last.request.url.params.get_list("escalation_policy_ids[]") == ["PEP_PAY"]
         assert contacts_route.call_count == 1
+        assert oncall.structured_content["has_more"] is False
         responder = oncall.structured_content["responders"][0]
         assert responder["first_name"] == "Kyle"
         assert responder["last_name"] == "Martinez"
@@ -204,6 +209,8 @@ async def test_mcp_tools_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
         assert inc_route.calls.last.request.url.params.get_list("include[]") == ["first_trigger_log_entries"]
         assert ctx.structured_content["id"] == "Q1V5DUDCJXCNJT"
         assert ctx.structured_content["priority"] == "P1"
+        assert ctx.structured_content["last_status_change_at"] == "2026-11-20T12:05:00Z"
+        assert ctx.structured_content["resolved_at"] is None
         assert ctx.structured_content["alerts"][0]["details"] == {"host": "pay-01"}
         assert ctx.structured_content["notes"][0]["content"] == "Rolling back deploy"
 
