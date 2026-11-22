@@ -43,7 +43,7 @@ pip install "mcp>=2,<3" "httpx>=0.27" "pydantic>=2" pytest pytest-asyncio respx
 ### VS Code (`.vscode/mcp.json` included)
 Open this folder in VS Code and start the `pagerduty` server from `.vscode/mcp.json` (it prompts for `PAGERDUTY_API_TOKEN` and launches `uv run server.py` over `stdio`).
 
-### Claude Desktop / Cursor (`claude_desktop_config.json` / `.cursor/mcp.json`)
+### Other MCP Clients (`mcpServers` JSON)
 
 ```json
 {
@@ -57,22 +57,6 @@ Open this folder in VS Code and start the `pagerduty` server from `.vscode/mcp.j
     }
   }
 }
-```
-
-### Claude Code CLI
-
-```bash
-claude mcp add pagerduty \
-  -e PAGERDUTY_API_TOKEN=<your_pagerduty_api_token> \
-  -- uv --directory /absolute/path/to/pagerduty-mcp-server run server.py
-```
-
-### MCP Inspector
-
-```bash
-npx @modelcontextprotocol/inspector \
-  -e PAGERDUTY_API_TOKEN=<your_pagerduty_api_token> \
-  uv run server.py
 ```
 
 ---
